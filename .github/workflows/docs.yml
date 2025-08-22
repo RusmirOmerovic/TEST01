@@ -1,0 +1,180 @@
+name: Generate Docs (README + Wiki)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      include-template:
+        description: 'Include template directories'
+        required: false
+        default: 'false'
+      force_refresh:
+        description: 'Erzwinge neue Generierung (README + Wiki) auch ohne Diff'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  docs:
+    name: Build docs with OpenAI, push Wiki, open PR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check required secret
+        id: secretcheck
+        run: |
+          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
+            echo "OPENAI_API_KEY is missing – skipping docs generation."
+            echo "missing=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "missing=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stop early if secret is missing
+        if: steps.secretcheck.outputs.missing == 'true'
+        run: echo "::notice title=Docs skipped::No OPENAI_API_KEY secret configured."
+
+      - name: Checkout repo (clean)
+        if: steps.secretcheck.outputs.missing == 'false'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          clean: true
+
+      - name: Setup Node
+        if: steps.secretcheck.outputs.missing == 'false'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install tools (jq, rsync)
+        if: steps.secretcheck.outputs.missing == 'false'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq rsync
+
+      - name: Install dependencies
+        if: steps.secretcheck.outputs.missing == 'false'
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Collect repository context
+        if: steps.secretcheck.outputs.missing == 'false'
+        env:
+          INCLUDE_TEMPLATE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.include-template || 'false' }}
+        run: |
+          set -euo pipefail
+          if [ "${INCLUDE_TEMPLATE}" = "true" ]; then FLAG="--all"; else FLAG="--user-only"; fi
+          node scripts/generate-docs.mjs "$FLAG" wiki
+          echo "Context size:" && wc -c repo_context.txt || true
+
+      - name: Generate README with OpenAI (scripted)
+        if: steps.secretcheck.outputs.missing == 'false'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FORCE_REFRESH: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_refresh || 'false' }}
+        run: |
+          bash scripts/ai-readme.sh "${FORCE_REFRESH}"
+
+      - name: Build Wiki from code comments
+        if: steps.secretcheck.outputs.missing == 'false'
+        run: node scripts/generate-docs.mjs --wiki
+
+      - name: Format README and Wiki
+        if: steps.secretcheck.outputs.missing == 'false'
+        run: npm run fmt README.md docs/wiki || true
+
+      - name: Push Wiki (hard overwrite)
+        if: steps.secretcheck.outputs.missing == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          WIKI_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git"
+
+          rm -rf wiki-repo
+          git clone "$WIKI_URL" wiki-repo
+
+          # Ziel-Branch bestimmen (master/main), Fallbacks
+          DEFAULT_BRANCH="$(git -C wiki-repo remote show origin | awk '/HEAD branch/ {print $NF}')"
+          [ -z "${DEFAULT_BRANCH:-}" ] && DEFAULT_BRANCH=master
+          if ! git -C wiki-repo ls-remote --exit-code --heads origin "${DEFAULT_BRANCH}" >/dev/null 2>&1; then
+            DEFAULT_BRANCH=main
+          fi
+          echo "Wiki default branch: $DEFAULT_BRANCH"
+
+          # Auf Remote-Stand auschecken
+          git -C wiki-repo fetch origin "${DEFAULT_BRANCH}"
+          git -C wiki-repo checkout -B "${DEFAULT_BRANCH}" "origin/${DEFAULT_BRANCH}" || git -C wiki-repo checkout --orphan "${DEFAULT_BRANCH}"
+
+          # Inhalte hart ersetzen
+          find wiki-repo -mindepth 1 -maxdepth 1 ! -name ".git" -exec rm -rf {} +
+          
+          # Falls im Remote noch alte README-Seiten existierten, sicher entfernen
+          rm -f wiki-repo/README.md wiki-repo/README || true
+          git -C wiki-repo rm -f --ignore-unmatch README.md README || true
+
+          # Jetzt syncen – README.md aus der Quelle ausschließen
+          rsync -a --delete \
+            --exclude 'README.md' \
+            docs/wiki/ wiki-repo/
+
+          git -C wiki-repo add -A
+          # Wenn es wirklich gar keine Änderungen gibt, sauber beenden
+          if git -C wiki-repo diff --cached --quiet; then
+            echo "No wiki changes to commit."
+            exit 0
+          fi
+
+          git -C wiki-repo commit -m "docs: update Wiki from workflow"
+          # Bewusst immer überschreiben:
+          git -C wiki-repo push --force "$WIKI_URL" HEAD:"${DEFAULT_BRANCH}"
+
+      - name: Prepare docs branch (for PR with README + docs/wiki)
+        if: steps.secretcheck.outputs.missing == 'false'
+        id: prep
+        run: |
+          set -euo pipefail
+          BR="docs/generated-${{ github.run_id }}"
+          echo "branch=$BR" >> "$GITHUB_OUTPUT"
+          # staged nur, um Changes zu prüfen; committet wird im nächsten Step
+          git add README.md docs/wiki || true
+          if git diff --cached --quiet; then
+            echo "No doc changes detected – skipping PR."
+            echo "skip_pr=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_pr=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Pull Request
+        id: cpr
+        if: steps.prep.outputs.skip_pr == 'false' && steps.secretcheck.outputs.missing == 'false'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: main
+          branch: ${{ steps.prep.outputs.branch }}
+          commit-message: 'docs: auto-generate README + Wiki'
+          title: 'Automatisch generierte Doku (README + Wiki)'
+          body: 'Dieser PR wurde automatisch erstellt – bitte prüfen und mergen.'
+          labels: 'automation, docs'
+          signoff: false
+          add-paths: |
+            README.md
+            docs/wiki/**
