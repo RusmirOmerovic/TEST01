@@ -25,7 +25,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const formatted = today.toLocaleDateString('de-DE', {
       day: '2-digit',
       month: '2-digit',
-      year: 'numeric'
+      year: 'numeric',
     })
     dateElem.textContent = `Diese Änderung wurde am ${formatted} vorgenommen.`
   }
