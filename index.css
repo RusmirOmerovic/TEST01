@@ -30,3 +30,9 @@ button:hover {
   background-color: #a9a30d;
   border: 1px solid #dee511;
 }
+/* Date display styling */
+#change-date {
+  font-style: italic;
+  color: gray;
+  margin-top: 1em;
+}
