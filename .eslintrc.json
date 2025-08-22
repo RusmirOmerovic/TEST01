@@ -3,6 +3,7 @@
   "env": { "browser": true, "es2022": true, "jest": true },
   "rules": {
     "no-unused-vars": ["warn", { "argsIgnorePattern": "^_" }],
-    "no-console": "off"
+    "no-console": "off",
+    "comma-dangle": ["error", "always-multiline"]
   }
 }

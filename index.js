@@ -16,3 +16,17 @@ toggleBtn.addEventListener('click', () => {
   // Update on-page text to reflect new theme
   themeIndicator.textContent = `Current Theme: ${isDarkMode ? 'Dark' : 'Light'}`
 })
+
+// aktuelles Datum in deutscher Schreibweise einfügen
+document.addEventListener('DOMContentLoaded', () => {
+  const dateElem = document.getElementById('change-date')
+  if (dateElem) {
+    const today = new Date()
+    const formatted = today.toLocaleDateString('de-DE', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+    })
+    dateElem.textContent = `Diese Änderung wurde am ${formatted} vorgenommen.`
+  }
+})
